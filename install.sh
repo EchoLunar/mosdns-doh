@@ -11,6 +11,7 @@ readonly MOSDNS_VERSION="${MOSDNS_VERSION:-v5.3.4-client-ecs}"
 readonly CADDY_VERSION="${CADDY_VERSION:-v2.11.4}"
 readonly DOH_PORT="${DOH_PORT:-8443}"
 readonly ARTIFACT_BASE_URL="${MOSDNS_DOH_ARTIFACT_BASE_URL:-https://github.com/EchoLunar/mosdns-doh/releases/download/${MOSDNS_VERSION}}"
+readonly CF_API_BASE="https://api.cloudflare.com/client/v4"
 
 readonly MOSDNS_BIN="/usr/local/bin/mosdns"
 readonly CADDY_BIN="/usr/local/bin/caddy"
@@ -26,8 +27,13 @@ DOH_DOMAIN="${DOH_DOMAIN:-}"
 CF_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
 OPEN_FIREWALL="${MOSDNS_DOH_OPEN_FIREWALL:-}"
 OVERWRITE="${MOSDNS_DOH_OVERWRITE:-}"
+IP_MODE="${MOSDNS_DOH_IP_MODE:-}"
 BACKUP_DIR=""
 TARGET_ARCH=""
+PUBLIC_IPV4=""
+PUBLIC_IPV6=""
+CF_ZONE_ID=""
+CF_ZONE_NAME=""
 
 log() {
     printf '[mosdns-doh] %s\n' "$*"
@@ -86,14 +92,14 @@ install_dependencies() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends \
-        ca-certificates curl coreutils iproute2 openssl procps tar gzip
+        ca-certificates curl coreutils iproute2 jq openssl procps tar gzip
 }
 
 open_prompt_tty() {
     if [ -t 0 ]; then
         PROMPT_FD=0
     else
-        exec {PROMPT_FD}<>/dev/tty || die "无法打开交互终端；非交互运行请设置 DOH_DOMAIN、CLOUDFLARE_API_TOKEN、MOSDNS_DOH_OPEN_FIREWALL 和 MOSDNS_DOH_OVERWRITE。"
+        exec {PROMPT_FD}<>/dev/tty || die "无法打开交互终端；非交互运行请设置 DOH_DOMAIN、CLOUDFLARE_API_TOKEN、MOSDNS_DOH_IP_MODE、MOSDNS_DOH_OPEN_FIREWALL 和 MOSDNS_DOH_OVERWRITE。"
     fi
 }
 
@@ -140,20 +146,172 @@ ask_yes_no() {
     done
 }
 
+ask_ip_mode() {
+    local variable=$1 answer
+    answer="${!variable:-}"
+    if [ -n "$answer" ]; then
+        case "${answer,,}" in
+            ipv4|4) printf -v "$variable" '%s' "ipv4"; return 0 ;;
+            ipv6|6) printf -v "$variable" '%s' "ipv6"; return 0 ;;
+            dual|both|双栈) printf -v "$variable" '%s' "dual"; return 0 ;;
+            *) die "$variable 必须是 ipv4、ipv6 或 dual。" ;;
+        esac
+    fi
+
+    while :; do
+        read -r -u "$PROMPT_FD" -p "自动解析本机公网地址到 Cloudflare（ipv4/ipv6/dual）[dual]：" answer || die "读取输入失败。"
+        printf '\n' >&2
+        answer="${answer:-dual}"
+        case "${answer,,}" in
+            ipv4|4) printf -v "$variable" '%s' "ipv4"; return 0 ;;
+            ipv6|6) printf -v "$variable" '%s' "ipv6"; return 0 ;;
+            dual|both|双栈) printf -v "$variable" '%s' "dual"; return 0 ;;
+            *) printf '%s\n' '请输入 ipv4、ipv6 或 dual。' >&2 ;;
+        esac
+    done
+}
+
 validate_inputs() {
     DOH_DOMAIN="${DOH_DOMAIN,,}"
     [[ "$DOH_DOMAIN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] \
         || die "DoH 域名格式不正确：$DOH_DOMAIN"
     [[ "$CF_TOKEN" != *[[:space:]]* ]] || die "Cloudflare API Token 不能包含空格或换行。"
     [ -n "$CF_TOKEN" ] || die "Cloudflare API Token 不能为空。"
+    case "$IP_MODE" in
+        ipv4|ipv6|dual) ;;
+        *) die "MOSDNS_DOH_IP_MODE 必须是 ipv4、ipv6 或 dual。" ;;
+    esac
     [ "$DOH_PORT" -ge 1 ] 2>/dev/null && [ "$DOH_PORT" -le 65535 ] \
         || die "DOH_PORT 必须是 1-65535 之间的端口。"
+}
+
+cf_api_request() {
+    local method=$1 url=$2 data=${3:-} response errors
+
+    if [ -n "$data" ]; then
+        response="$(curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+            --connect-timeout 15 --max-time 60 --proto '=https' --tlsv1.2 \
+            -X "$method" \
+            -H "Authorization: Bearer $CF_TOKEN" \
+            -H 'Content-Type: application/json' \
+            --data-raw "$data" "$url")" || die "Cloudflare API 请求失败。"
+    else
+        response="$(curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+            --connect-timeout 15 --max-time 60 --proto '=https' --tlsv1.2 \
+            -X "$method" \
+            -H "Authorization: Bearer $CF_TOKEN" \
+            -H 'Content-Type: application/json' \
+            "$url")" || die "Cloudflare API 请求失败。"
+    fi
+
+    if ! jq -e '.success == true' >/dev/null <<<"$response"; then
+        errors="$(jq -r '[.errors[]? | (.message // "未知错误")] | join("; ")' <<<"$response" 2>/dev/null || true)"
+        die "Cloudflare API 返回错误：${errors:-未知错误}"
+    fi
+    printf '%s' "$response"
+}
+
+find_cloudflare_zone() {
+    local candidate="$DOH_DOMAIN" response zone_count
+
+    while [[ "$candidate" == *.* ]]; do
+        response="$(cf_api_request GET "${CF_API_BASE}/zones?name=${candidate}&status=active&per_page=50")"
+        zone_count="$(jq '.result | length' <<<"$response")"
+        if [ "$zone_count" -gt 0 ]; then
+            CF_ZONE_ID="$(jq -r '.result[0].id' <<<"$response")"
+            CF_ZONE_NAME="$(jq -r '.result[0].name' <<<"$response")"
+            break
+        fi
+        candidate="${candidate#*.}"
+    done
+
+    [ -n "$CF_ZONE_ID" ] || die "Cloudflare 中找不到 ${DOH_DOMAIN} 对应的活动 Zone；请确认域名已接入当前账号。"
+    log "已找到 Cloudflare Zone：${CF_ZONE_NAME}。"
+}
+
+is_valid_ipv4() {
+    awk -F. '
+        NF != 4 { exit 1 }
+        {
+            for (i = 1; i <= 4; i++) {
+                if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1
+            }
+        }
+    ' <<<"$1"
+}
+
+is_valid_ipv6() {
+    [[ "$1" == *:* && "$1" != *[!0-9A-Fa-f:]* ]]
+}
+
+detect_public_addresses() {
+    case "$IP_MODE" in
+        ipv4|dual)
+            PUBLIC_IPV4="$(curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+                --connect-timeout 15 --max-time 60 --proto '=https' --tlsv1.2 --ipv4 \
+                https://api.ipify.org)" || die "无法检测本机公网 IPv4 地址。"
+            is_valid_ipv4 "$PUBLIC_IPV4" || die "检测到的公网 IPv4 地址无效：$PUBLIC_IPV4"
+            log "检测到本机公网 IPv4：${PUBLIC_IPV4}。"
+            ;;
+    esac
+
+    case "$IP_MODE" in
+        ipv6|dual)
+            PUBLIC_IPV6="$(curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+                --connect-timeout 15 --max-time 60 --proto '=https' --tlsv1.2 --ipv6 \
+                https://api6.ipify.org)" || die "无法检测本机公网 IPv6 地址；如果服务器没有 IPv6，请选择 ipv4。"
+            is_valid_ipv6 "$PUBLIC_IPV6" || die "检测到的公网 IPv6 地址无效：$PUBLIC_IPV6"
+            log "检测到本机公网 IPv6：${PUBLIC_IPV6}。"
+            ;;
+    esac
+}
+
+sync_cloudflare_record() {
+    local record_type=$1 content=$2 response record_count record_id proxied payload
+    response="$(cf_api_request GET \
+        "${CF_API_BASE}/zones/${CF_ZONE_ID}/dns_records?type=${record_type}&name=${DOH_DOMAIN}&per_page=100")"
+    record_count="$(jq '.result | length' <<<"$response")"
+
+    if [ "$record_count" -gt 0 ]; then
+        [ "$record_count" -eq 1 ] || warn "${DOH_DOMAIN} 存在 ${record_count} 条 ${record_type} 记录，将只更新第一条。"
+        record_id="$(jq -r '.result[0].id' <<<"$response")"
+        proxied="$(jq -r '.result[0].proxied // false' <<<"$response")"
+        payload="$(jq -cn --arg type "$record_type" --arg name "$DOH_DOMAIN" \
+            --arg content "$content" --argjson proxied "$proxied" \
+            '{type: $type, name: $name, content: $content, ttl: 1, proxied: $proxied}')"
+        cf_api_request PUT "${CF_API_BASE}/zones/${CF_ZONE_ID}/dns_records/${record_id}" "$payload" >/dev/null
+        log "Cloudflare ${record_type} 记录已更新：${DOH_DOMAIN} -> ${content}。"
+    else
+        payload="$(jq -cn --arg type "$record_type" --arg name "$DOH_DOMAIN" \
+            --arg content "$content" \
+            '{type: $type, name: $name, content: $content, ttl: 1, proxied: false}')"
+        cf_api_request POST "${CF_API_BASE}/zones/${CF_ZONE_ID}/dns_records" "$payload" >/dev/null
+        log "Cloudflare ${record_type} 记录已创建：${DOH_DOMAIN} -> ${content}（DNS only）。"
+    fi
+}
+
+configure_cloudflare_dns() {
+    command -v jq >/dev/null 2>&1 || die "找不到 jq；请重新运行安装器以安装依赖。"
+    detect_public_addresses
+    find_cloudflare_zone
+
+    case "$IP_MODE" in
+        ipv4|dual) sync_cloudflare_record A "$PUBLIC_IPV4" ;;
+    esac
+    case "$IP_MODE" in
+        ipv6|dual) sync_cloudflare_record AAAA "$PUBLIC_IPV6" ;;
+    esac
+
+    if [[ "$IP_MODE" != dual ]]; then
+        warn "未选择的另一种地址类型不会被脚本删除；如已有对应记录，请按需手动清理。"
+    fi
 }
 
 prompt_install_inputs() {
     open_prompt_tty
     ask_text "DoH 域名（例如 dns.example.com）：" DOH_DOMAIN
     ask_secret "Cloudflare API Token（输入不回显）：" CF_TOKEN
+    ask_ip_mode IP_MODE
     ask_yes_no "是否自动在本机 UFW 放行 TCP ${DOH_PORT}？" OPEN_FIREWALL "no"
     ask_yes_no "检测到已有配置时是否备份并覆盖？" OVERWRITE "no"
     validate_inputs
@@ -791,6 +949,7 @@ install_flow() {
     prompt_install_inputs
     prepare_backup
     install_dependencies
+    configure_cloudflare_dns
     ensure_service_user
     install_binaries
     write_local_override_file
@@ -848,7 +1007,7 @@ usage() {
   install.sh renew           重新加载 Caddy 以应用证书/配置
 
 非交互安装变量：
-  DOH_DOMAIN=... CLOUDFLARE_API_TOKEN=... \
+  DOH_DOMAIN=... CLOUDFLARE_API_TOKEN=... MOSDNS_DOH_IP_MODE=dual \
   MOSDNS_DOH_OPEN_FIREWALL=yes MOSDNS_DOH_OVERWRITE=yes \
   install.sh install
 

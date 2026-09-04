@@ -10,9 +10,20 @@
 curl -fsSL https://raw.githubusercontent.com/EchoLunar/mosdns-doh/main/install.sh | sudo bash
 ```
 
-安装器会交互询问 DoH 域名、Cloudflare API Token、是否放行 TCP 8443，以及是否覆盖已有配置。
+安装器会交互询问 DoH 域名、Cloudflare API Token、使用 IPv4/IPv6/双栈、是否放行 TCP 8443，以及是否覆盖已有配置。随后会自动检测本机公网地址，并在 Cloudflare 中创建或更新对应的 A/AAAA 记录。
 
-Cloudflare Token 只需要目标 Zone 的 DNS 编辑权限。DoH 域名的 A/AAAA 记录需要提前指向服务器。
+Cloudflare Token 只需要目标 Zone 的 DNS 编辑权限。新创建的记录默认是 DNS only（灰云）；已有记录会保留原来的代理状态。未选择的地址类型不会被脚本删除。
+
+地址模式可选择：`ipv4`、`ipv6` 或 `dual`。非交互安装时设置 `MOSDNS_DOH_IP_MODE`，例如：
+
+```bash
+DOH_DOMAIN=dns.example.com \
+CLOUDFLARE_API_TOKEN=你的令牌 \
+MOSDNS_DOH_IP_MODE=dual \
+MOSDNS_DOH_OPEN_FIREWALL=yes \
+MOSDNS_DOH_OVERWRITE=no \
+bash install.sh install
+```
 
 ## 当前配置
 
