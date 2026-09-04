@@ -571,13 +571,21 @@ write_cloudflare_env() {
 }
 
 write_caddy_config() {
+    local bind_directive
+    case "$IP_MODE" in
+        ipv4) bind_directive='    bind 0.0.0.0' ;;
+        ipv6) bind_directive='    bind ::' ;;
+        dual) bind_directive='' ;;
+        *) die "未知地址模式：$IP_MODE" ;;
+    esac
+
     atomic_install_stdin "$CADDY_CONFIG" root root 0644 <<EOF
 {
     auto_https disable_redirects
 }
 
 ${DOH_DOMAIN}:${DOH_PORT} {
-    bind ::
+${bind_directive}
 
     tls {
         dns cloudflare {env.CLOUDFLARE_API_TOKEN}
@@ -783,7 +791,7 @@ EOF
 
     atomic_install_stdin /etc/systemd/system/caddy.service root root 0644 <<'EOF'
 [Unit]
-Description=Caddy IPv6-only DoH frontend
+Description=Caddy DoH frontend
 Documentation=https://caddyserver.com/docs/
 Wants=network-online.target
 After=network-online.target mosdns.service
